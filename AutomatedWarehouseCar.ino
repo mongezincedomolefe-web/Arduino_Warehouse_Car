@@ -1,226 +1,194 @@
-#include <Servo.h> 
-int pinLB=14;     // Define a 14 Pin
-int pinLF=15;     // Define a 15 Pin
+#include <Servo.h>
 
-int pinRB=16;    // Define a 16 Pin
-int pinRF=17;    // Define a 17 Pin
+// ================= PIN MAP (per your wiring) =================
+// L298N Motor Driver
+const int IN1 = 4;
+const int IN2 = 5;
+const int IN3 = 6;
+const int IN4 = 7;
 
-//int MotorLPWM=5;  //Define a 5 Pin
-//int MotorRPWM=6;  //Define a 6 Pin
+// IR Line Sensor (single sensor, digital)
+const int irPin = 2;
 
-int inputPin = 9;  // Define the ultrasound signal receiving a Pin
-int outputPin =8;  //Define the ultrasound signal emission Pin
+// LOW or HIGH when sitting ON the black line - flip the logic below if needed.
 
-int Fspeedd = 0;      // go
-int Rspeedd = 0;      // The right to
-int Lspeedd = 0;      // Turn left to
-int directionn = 0;   // After the former = 8 = 2 left = 4 right = 6 
-Servo myservo;        // Set up the myservo
-int delay_time = 250; // After the servo motor to the stability of the time
+// HC-SR04 Ultrasonic Sensor
+const int trigPin = 13;
+const int echoPin = 12;
 
-int Fgo = 8;         // go
-int Rgo = 6;         // The right to
-int Lgo = 4;         // Turn left to
-int Bgo = 2;         // astern
+// Servos
+Servo liftServo;   // was the "ultrasonic pan" servo - repurposed to raise/lower the gripper arm
+Servo gripServo;   // opens/closes the gripper claw
+const int liftServoPin = 11;
+const int gripServoPin = 10;
 
-void setup()
- {
-  Serial.begin(9600);     // Initialize 
-  pinMode(pinLB,OUTPUT); // Define 14 pin for the output (PWM)
-  pinMode(pinLF,OUTPUT); // Define 15 pin for the output (PWM)
-  pinMode(pinRB,OUTPUT); // Define 16 pin for the output (PWM) 
-  pinMode(pinRF,OUTPUT); // Define 17 pin for the output (PWM)
-  
-  //pinMode(MotorLPWM,  OUTPUT);  // Define 5 pin for PWM output 
- // pinMode(MotorRPWM,  OUTPUT);  // Define 6 pin for PWM output
-  
-  pinMode(inputPin, INPUT);    // Define the ultrasound enter pin
-  pinMode(outputPin, OUTPUT);  // Define the ultrasound output pin   
+// ================= TUNE THESE TO YOUR BUILD =================
+const int LIFT_UP     = 30;   // angle when arm is raised
+const int LIFT_DOWN   = 120;  // angle when arm is lowered to grab/release
+const int GRIP_OPEN   = 40;   // claw open angle
+const int GRIP_CLOSE  = 120;  // claw closed angle
+const int STATION_TRIGGER_CM = 8;  // how close a station marker must be to trigger a stop
 
-  myservo.attach(11);    // Define the servo motor output 10 pin(PWM)
- }
-void advance(int a)     // go
-    {
-     digitalWrite(pinRB,HIGH);  // 16 feet for high level
-     digitalWrite(pinRF,LOW);   //17 feet for low level
-     //analogWrite(MotorRPWM,180);//Set the output speed(PWM)
-     digitalWrite(pinLB,HIGH);  // 14 feet for high level
-     digitalWrite(pinLF,LOW);   //15 feet for high level
-     //analogWrite(MotorLPWM,180);//Set the output speed(PWM)
-     delay(a * 1);     
+// ================= STATION / BOX LOGIC =================
+int stationCount = 0;                 // resets after each full pick+deliver cycle
+const int PICKUP_STATION = 1;         // station number = pickup point
+const int DELIVERY_STATIONS[] = {2, 3, 4};  // destinations for Box A, B, C in turn
+int boxRunNumber = 0;                 // which pick-and-place cycle we're on (0=Box A, 1=Box B, 2=Box C)
+
+// ================= LINE SEARCH MEMORY =================
+int lastTurnDirection = 1;  // 1 = try right first, -1 = try left first
+
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  pinMode(irPin, INPUT);
+
+  pinMode(trigPin, OUTPUT);
+  pinMode(echoPin, INPUT);
+
+  liftServo.attach(liftServoPin);
+  gripServo.attach(gripServoPin);
+
+  liftServo.write(LIFT_UP);
+  gripServo.write(GRIP_OPEN);
+
+  delay(500); // let servos settle before the robot moves
+}
+
+// ================= MOTOR PRIMITIVES =================
+void motorsForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+void motorsTurnLeft() {
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+void motorsTurnRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, LOW);
+}
+void motorsReverse() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+// ================= LINE FOLLOWING (single sensor) =================
+// Only one sensor means we can't tell which side the line drifted to.
+// Strategy: drive forward while the line is seen; the instant it's lost,
+// do a short turn to search for it, alternating direction if needed.
+void followLine() {
+  int lineState = digitalRead(irPin);
+
+  if (lineState == HIGH) {        // LOW = on the black line (verify polarity!)
+    motorsForward();
+  } else {
+    motorsStop();
+    delay(50);
+    searchForLine();
+  }
+}
+
+void searchForLine() {
+  if (lastTurnDirection == 1) {
+    motorsTurnRight();
+  } else {
+    motorsTurnLeft();
+  }
+  delay(150);
+  motorsStop();
+
+  if (digitalRead(irPin) == LOW) return;  // re-found the line
+
+  lastTurnDirection *= -1;                 // flip and try the other way, a bit further
+  if (lastTurnDirection == 1) {
+    motorsTurnRight();
+  } else {
+    motorsTurnLeft();
+  }
+  delay(300);
+  motorsStop();
+}
+
+// ================= ULTRASONIC DISTANCE =================
+long readDistanceCM() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 30000); // 30ms timeout
+  long distance = duration * 0.0343 / 2;         // convert to cm
+  return distance;
+}
+
+bool atStationMarker() {
+  long d = readDistanceCM();
+  return (d > 0 && d < STATION_TRIGGER_CM);
+}
+
+// ================= GRIPPER SEQUENCES =================
+void pickUpBox() {
+  motorsStop();
+  Serial.println("Picking up box...");
+  liftServo.write(LIFT_DOWN);
+  delay(500);
+  gripServo.write(GRIP_CLOSE);
+  delay(500);
+  liftServo.write(LIFT_UP);
+  delay(500);
+}
+
+void releaseBox() {
+  motorsStop();
+  Serial.println("Releasing box...");
+  liftServo.write(LIFT_DOWN);
+  delay(500);
+  gripServo.write(GRIP_OPEN);
+  delay(500);
+  liftServo.write(LIFT_UP);
+  delay(500);
+}
+
+// ================= STATION HANDLING =================
+void handleStation() {
+  stationCount++;
+  Serial.print("Reached station #");
+  Serial.println(stationCount);
+
+  if (stationCount == PICKUP_STATION) {
+    delay(300);
+    pickUpBox();
+  } else {
+    int targetStation = DELIVERY_STATIONS[boxRunNumber % 3];
+    if (stationCount == targetStation) {
+      delay(300);
+      releaseBox();
+      boxRunNumber++;
+      stationCount = 0;   // reset for the next box's cycle
     }
+  }
 
-void right(int b)        //right
-    {
-     digitalWrite(pinRB,LOW);   
-     digitalWrite(pinRF,HIGH);
-     //analogWrite(MotorRPWM,250);
-     digitalWrite(pinLB,LOW);
-     digitalWrite(pinLF,LOW);
-     delay(b * 100);
-    }
-void left(int c)         //left
-    {
-     digitalWrite(pinRB,LOW);
-     digitalWrite(pinRF,LOW);
-     digitalWrite(pinLB,LOW);   
-     digitalWrite(pinLF,HIGH);
-     //analogWrite(MotorLPWM,250);
-     delay(c * 100);
-    }
-void turnR(int d)        //right
-    {
-     digitalWrite(pinRB,HIGH);  
-     digitalWrite(pinRF,LOW);
-     //analogWrite(MotorRPWM,250);
-     digitalWrite(pinLB,LOW);
-     digitalWrite(pinLF,HIGH);  
-     //analogWrite(MotorLPWM,250);
-     delay(d * 50);
-    }
-void turnL(int e)        //left
-    {
-     digitalWrite(pinRB,LOW);
-     digitalWrite(pinRF,HIGH);   
-     //analogWrite(MotorRPWM,220);
-     digitalWrite(pinLB,HIGH);   
-     digitalWrite(pinLF,LOW);
-     //analogWrite(MotorLPWM,220);
-     delay(e * 50);
-    }    
-void stopp(int f)         //stop
-    {
-     digitalWrite(pinRB,LOW);
-     digitalWrite(pinRF,LOW);
-     digitalWrite(pinLB,LOW);
-     digitalWrite(pinLF,LOW);
-     delay(f * 100);
-    }
-void back(int g)          //back
-    {
+  delay(500);        // clear the marker before resuming
+  motorsForward();
+  delay(300);
+}
 
-     digitalWrite(pinRB,LOW);  
-     digitalWrite(pinRF,HIGH);
-     //analogWrite(MotorRPWM,0);
-     digitalWrite(pinLB,LOW);  
-     digitalWrite(pinLF,HIGH);
-     //analogWrite(MotorLPWM,230);
-     delay(g * 500);     
-    }
-    
-void detection()        //Measuring three angles(0.90.179)
-    {      
-      int delay_time = 200;   // After the servo motor to the stability of the time
-      ask_pin_F();            // Read in front of the distance
-      
-     if(Fspeedd < 10)         // If the front distance less than 10 cm
-      {
-      stopp(1);               // Remove the output data 
-      back(2);                // The back two milliseconds
-      }
-           
-      if(Fspeedd < 25)         // If the front distance less than 25 cm
-      {
-        stopp(1);               // Remove the output data
-        ask_pin_L();            // Read the left distance
-        delay(delay_time);      // Waiting for the servo motor is stable
-        ask_pin_R();            // Read the right distance  
-        delay(delay_time);      //  Waiting for the servo motor is stable  
-        
-        if(Lspeedd > Rspeedd)   //If the distance is greater than the right distance on the left
-        {
-         directionn = Lgo;      //Left
-        }
-        
-        if(Lspeedd <= Rspeedd)   //If the distance is less than or equal to the distance on the right
-        {
-         directionn = Rgo;      //right
-        } 
-        
-        if (Lspeedd < 15 && Rspeedd < 15)   /*If the left front distance and distance and the right distance is less than 15 cm */
-        {
-
-         directionn = Bgo;      //Walk backwards        
-        }          
-      }
-      else                      //If the front is not less than 25 cm (greater than)    
-      {
-        directionn = Fgo;        //Walk forward    
-      }
-     
-    }    
-void ask_pin_F()   // Measure the distance ahead
-    {
-      myservo.write(90);
-      digitalWrite(outputPin, LOW);   // For low voltage 2 us ultrasonic launch
-      delayMicroseconds(2);
-      digitalWrite(outputPin, HIGH);  // Let ultrasonic launch 10 us high voltage, there is at least 10 us
-      delayMicroseconds(10);
-      digitalWrite(outputPin, LOW);    // Maintaining low voltage ultrasonic launch
-      float Fdistance = pulseIn(inputPin, HIGH);  // Read the time difference
-      Fdistance= Fdistance/5.8/10;       // A time to distance distance (unit: cm  
-      Serial.print("F distance:");      //The output distance (unit: cm)
-      Serial.println(Fdistance);         //According to the distance
-      Fspeedd = Fdistance;              
-    }  
- void ask_pin_L()   // Measure the distance on the left 
-    {
-      myservo.write(5);
-      delay(delay_time);
-      digitalWrite(outputPin, LOW);   // For low voltage 2 us ultrasonic launch
-      delayMicroseconds(2);
-      digitalWrite(outputPin, HIGH);  // Let ultrasonic launch 10 us high voltage, there is at least 10 us
-      delayMicroseconds(10);
-      digitalWrite(outputPin, LOW);    // Maintaining low voltage ultrasonic launch
-      float Ldistance = pulseIn(inputPin, HIGH);  // Read the time difference
-      Ldistance= Ldistance/5.8/10;       // Will be time to distance distance (unit: cm)
-      Serial.print("L distance:");       //The output distance (unit: cm)
-      Serial.println(Ldistance);         //According to the distance
-      Lspeedd = Ldistance;              // Will reading Lspeedd distance
-    }  
-void ask_pin_R()   // Measure the distance on the right 
-    {
-      myservo.write(177);
-      delay(delay_time);
-      digitalWrite(outputPin, LOW);   // For low voltage 2 us ultrasonic launch
-      delayMicroseconds(2);
-      digitalWrite(outputPin, HIGH);  // Let ultrasonic launch 10 us high voltage, there is at least 10 us
-      delayMicroseconds(10);
-      digitalWrite(outputPin, LOW);    // Maintaining low voltage ultrasonic launch
-      float Rdistance = pulseIn(inputPin, HIGH);  // Read the time difference
-      Rdistance= Rdistance/5.8/10;       //Will be time to distance distance (unit: cm)
-      Serial.print("R distance:");       //The output distance (unit: cm)
-      Serial.println(Rdistance);         //According to the distance
-      Rspeedd = Rdistance;              
-    }  
-    
-void loop()
- {
-    myservo.write(90);  /*Make the servo motor ready position Prepare the next measurement */
-    detection();        //Measuring Angle And determine which direction to go to
-      
-   if(directionn == 2)  //If directionn (direction) = 2 (back)          
-   {
-     back(8);                    //  back
-     turnL(2);                   //Move slightly to the left (to prevent stuck in dead end lane)
-     Serial.print(" Reverse ");   //According to the direction (reverse)
-   }
-   if(directionn == 6)           //If directionn (direction) = 6 (right)   
-   {
-     back(1); 
-     turnR(6);                   // right
-     Serial.print(" Right ");    //According to the direction (Right)
-   }
-   if(directionn == 4)          //If directionn (direction) = 4 (left)   
-   {  
-     back(1);      
-     turnL(6);                  // left
-     Serial.print(" Left ");     //According to the direction (Left)  
-   }  
-   if(directionn == 8)          //If directionn (direction) = 8 (forward)      
-   { 
-    advance(1);                 // go 
-    Serial.print(" Advance ");   //According to the direction (Advance)
-    Serial.print("   ");    
-   }
- }
+// ================= MAIN LOOP =================
+void loop() {
+  if (atStationMarker()) {
+    handleStation();
+  } else {
+    followLine();
+  }
+}
