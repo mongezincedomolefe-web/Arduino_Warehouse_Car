@@ -89,7 +89,7 @@ void motorsReverse() {
 void followLine() {
   int lineState = digitalRead(irPin);
 
-  if (lineState == HIGH) {        // LOW = on the black line (verify polarity!)
+  if (lineState == LOW) {        // LOW = on the black line (verify polarity!)
     motorsForward();
   } else {
     motorsStop();
